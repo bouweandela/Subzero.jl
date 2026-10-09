@@ -591,6 +591,22 @@ function update_velocities!(floes::FixedWidthFloes{FT}, i, Δt, maximum_ξ) wher
     return
 end
 
+#=
+All steps of timestep_floe_properties! for floe i. Each step only uses floe i, so they run
+in a single kernel: this is faster than one kernel per step, because the floe's values stay
+in registers instead of being read from and written to device memory by every kernel.
+=#
+function timestep_floe!(floes::FixedWidthFloes, i, Δt, stress_calculator, max_floe_height, maximum_ξ)
+    calc_stress!(floes, i, stress_calculator)
+    limit_height!(floes, i, max_floe_height)
+    limit_collision_force!(floes, i, Δt)
+    thermodynamic_growth!(floes, i)
+    update_ice_coordinates!(floes, i, Δt)
+    update_velocities!(floes, i, Δt, maximum_ξ)
+    calc_strain!(floes, i)
+    return
+end
+
 # Log the events that kernels reported in flags, once per type of event
 function _log_flags(flags, tstep, floe_settings)
     nfloes(flag) = count(f -> f & flag != 0, flags)
@@ -631,12 +647,7 @@ function timestep_floe_properties!(
     floe_settings;
     backend = CPU(),
 )
-    launch_per_floe!(calc_stress!, backend, floes, floe_settings.stress_calculator)
-    launch_per_floe!(limit_height!, backend, floes, floe_settings.max_floe_height)
-    launch_per_floe!(limit_collision_force!, backend, floes, Δt)
-    launch_per_floe!(thermodynamic_growth!, backend, floes)
-    launch_per_floe!(update_ice_coordinates!, backend, floes, Δt)
-    launch_per_floe!(update_velocities!, backend, floes, Δt, floe_settings.maximum_ξ)
-    launch_per_floe!(calc_strain!, backend, floes)
+    launch_per_floe!(timestep_floe!, backend, floes, Δt, floe_settings.stress_calculator,
+        floe_settings.max_floe_height, floe_settings.maximum_ξ)
     return
 end
