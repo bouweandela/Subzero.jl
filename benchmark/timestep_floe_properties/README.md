@@ -1,8 +1,9 @@
-# Benchmark: `timestep_floe_properties!` on CUDA vs `main`
+# Benchmark: `timestep_floe_properties!` on the GPU vs `main`
 
 Compares `timestep_floe_properties!` on the `gpu-version` branch (KernelAbstractions
 kernels on `FixedWidthFloes`) with the same function on `main` (a `Threads.@threads`
-loop over the floe `StructArray`).
+loop over the floe `StructArray`). The branch is benchmarked on the CPU backend and on
+NVIDIA (CUDA.jl) or AMD (AMDGPU.jl) GPUs. The results below are from an NVIDIA GPU.
 
 ## Input
 
@@ -39,7 +40,7 @@ starts from a fresh `deepcopy` of the input, made in `setup` and not timed.
 - **branch, kernels only**: `timestep_floe_properties!(dev_floes, Δt, floe_settings; backend)`
   followed by `KernelAbstractions.synchronize(backend)`, with `dev_floes` already on the
   device. This is 7 kernel launches.
-- **branch, Float32 kernels only** (CUDA only): the same, with every `Float64` array of the
+- **branch, Float32 kernels only** (GPU only): the same, with every `Float64` array of the
   `FixedWidthFloes` converted to `Float32` and `FloeSettings(Float32)`. The kernels still do
   some `Float64` maths because of `Float64` literals (`1.5Δt`), see `AGENTS.md`.
 - **branch, full step**: what `run!` does around the call: `FixedWidthFloes(floes)`,
@@ -239,10 +240,16 @@ git -C $REPO worktree remove "$WORK/subzero-main"                     # clean up
    folder, 24 MB, not committed) into the work directory first.
 2. `bench_main.jl` with the `main` environment, with 1 and 20 threads.
 3. `bench_branch.jl` with the branch environment, with 1 thread (CPU only,
-   `BENCH_BACKENDS=CPU`) and 20 threads (CPU and CUDA).
+   `BENCH_BACKENDS=CPU`) and 20 threads (CPU and GPU).
+
+`setup.sh` adds CUDA.jl to the branch environment if `nvidia-smi` is found, and AMDGPU.jl
+if `rocminfo` or `rocm-smi` is found. To choose yourself, set `BENCH_GPU`, for example
+`BENCH_GPU=AMDGPU setup.sh "$WORK"` (or `BENCH_GPU=""` for no GPU package).
 
 Environment variables for the benchmark scripts: `BENCH_SIZES` (comma-separated numbers of
 floes, default `1000,10000,100000`), `BENCH_SECONDS` (time budget per benchmark, default
-10; `run_all.sh` uses 15), `BENCH_BACKENDS` (default `CPU,CUDA`), and `BENCH_FLOES` (input
+10; `run_all.sh` uses 15), `BENCH_BACKENDS` (comma-separated,
+from `CPU`, `CUDA`, `AMDGPU`; default `CPU` plus each of CUDA.jl and AMDGPU.jl that is in
+the environment and has a working GPU), and `BENCH_FLOES` (input
 file, default `floes_10k.jld2`). Run `bench_main.jl` before `bench_branch.jl`, because it
 writes `result_main.jld2` for the correctness check.

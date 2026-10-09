@@ -1,11 +1,44 @@
 # Benchmark timestep_floe_properties! on the gpu-version branch (KernelAbstractions kernels).
 # Usage: julia -t <nthreads> --project=env-branch bench_branch.jl
-# Set BENCH_BACKENDS=CPU to skip CUDA (e.g. for a single-thread CPU run).
+# Set BENCH_BACKENDS to choose the backends, e.g. BENCH_BACKENDS=CPU to skip the GPU (for a
+# single-thread CPU run), or BENCH_BACKENDS=CPU,AMDGPU. By default, CPU and every GPU
+# package (CUDA, AMDGPU) that is installed in the environment and has a working GPU.
 include("common.jl")
-using CUDA, Adapt, KernelAbstractions
+using Adapt, KernelAbstractions
 using Subzero: FixedWidthFloes, timestep_floe_properties!, update_floes!, _log_flags
 
-const BACKENDS = split(get(ENV, "BENCH_BACKENDS", "CPU,CUDA"), ",")
+# GPU packages that can be benchmarked, with their KernelAbstractions backend
+const GPU_BACKENDS = Dict("CUDA" => :CUDABackend, "AMDGPU" => :ROCBackend)
+
+const BACKENDS = if haskey(ENV, "BENCH_BACKENDS")
+    split(ENV["BENCH_BACKENDS"], ",")
+else
+    ["CPU"; filter(p -> Base.find_package(p) !== nothing, sort!(collect(keys(GPU_BACKENDS))))]
+end
+for name in filter(!=("CPU"), BACKENDS)
+    haskey(GPU_BACKENDS, name) ||
+        error("unknown backend $name, expected CPU, $(join(keys(GPU_BACKENDS), ", "))")
+    @eval using $(Symbol(name))
+end
+gpu_functional(name) = getfield(Main, Symbol(name)).functional()
+if haskey(ENV, "BENCH_BACKENDS")
+    for name in filter(!=("CPU"), BACKENDS)
+        gpu_functional(name) || error("BENCH_BACKENDS contains $name, but $name.functional() is false")
+    end
+else  # skip GPU packages without a working GPU
+    filter!(name -> name == "CPU" || gpu_functional(name), BACKENDS)
+end
+
+get_backend(name) = name == "CPU" ? CPU() :
+    getfield(getfield(Main, Symbol(name)), GPU_BACKENDS[name])()
+
+function print_device(name)
+    if name == "CUDA"
+        println(CUDA.name(CUDA.device()), ", CUDA runtime ", CUDA.runtime_version())
+    elseif name == "AMDGPU"
+        println(AMDGPU.HIP.name(AMDGPU.device()), ", HIP runtime ", AMDGPU.HIP.runtime_version())
+    end
+end
 
 # Convert a FixedWidthFloes to Float32 (integer fields are kept as they are)
 to_float32(fwf::FixedWidthFloes) = FixedWidthFloes(
@@ -29,7 +62,7 @@ function kernels!(dev_floes, Δt, fs, backend)
     KernelAbstractions.synchronize(backend)
 end
 
-CUDA.functional() && println(CUDA.name(CUDA.device()), ", CUDA runtime ", CUDA.runtime_version())
+foreach(print_device, BACKENDS)
 println("gpu-version branch, Julia threads = $(Threads.nthreads())")
 fs64, fs32 = floe_settings(Float64), floe_settings(Float32)
 
@@ -39,7 +72,7 @@ if isfile("result_main.jld2")
     nref = load("result_main.jld2", "n")
     for name in BACKENDS
         floes, Δt = load_floes(nref)
-        full_step!(floes, Δt, fs64, name == "CUDA" ? CUDABackend() : CPU())
+        full_step!(floes, Δt, fs64, get_backend(name))
         res = result_fields(floes)
         flat(x) = eltype(x) <: Number ? x : reduce(vcat, vec.(x))
         maxrel = maximum(f -> maximum(abs.(flat(res[f]) .- flat(ref[f]))) /
@@ -52,12 +85,12 @@ for n in SIZES
     floes, Δt = load_floes(n)
     fwf = FixedWidthFloes(floes)
     for name in BACKENDS
-        backend = name == "CUDA" ? CUDABackend() : CPU()
+        backend = get_backend(name)
         # Kernels only: floes are already on the device
         trial = @benchmark(kernels!(d, $Δt, $fs64, $backend),
             setup = (d = adapt($backend, deepcopy($fwf))), evals = 1, seconds = SECONDS)
         report("branch $name Float64: kernels only", n, trial)
-        if name == "CUDA"
+        if name != "CPU"
             fwf32 = to_float32(fwf)
             trial = @benchmark(kernels!(d, $Δt, $fs32, $backend),
                 setup = (d = adapt($backend, deepcopy($fwf32))), evals = 1, seconds = SECONDS)
