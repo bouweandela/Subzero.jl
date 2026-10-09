@@ -40,10 +40,37 @@ function print_device(name)
     end
 end
 
+# Device memory in use, in bytes (by all processes on the device)
+function gpu_used_memory(name)
+    if name == "CUDA"
+        CUDA.total_memory() - CUDA.free_memory()
+    elseif name == "AMDGPU"
+        free, total = AMDGPU.info()
+        total - free
+    else
+        0
+    end
+end
+
 # Convert a FixedWidthFloes to Float32 (integer fields are kept as they are)
 to_float32(fwf::FixedWidthFloes) = FixedWidthFloes(
     (x -> eltype(x) == Float64 ? Float32.(x) : copy(x)).(getfield.(Ref(fwf), fieldnames(FixedWidthFloes)))...,
 )
+
+# Copy all fields of src into dst, to reset dst between samples. This is much faster than
+# making a new copy, and doesn't leave garbage that fills up the memory.
+function reset!(dst::FixedWidthFloes, src::FixedWidthFloes, backend)
+    foreach(f -> copyto!(getfield(dst, f), getfield(src, f)), fieldnames(FixedWidthFloes))
+    KernelAbstractions.synchronize(backend)
+end
+
+# Free the device memory of floes right away, instead of when they are garbage collected.
+# KernelAbstractions.unsafe_free! does nothing for a CuArray (CUDA.jl 6), so use the GPU
+# packages' own unsafe_free!.
+unsafe_free!(x) = nothing
+"CUDA" in BACKENDS && @eval unsafe_free!(x::CUDA.CuArray) = CUDA.unsafe_free!(x)
+"AMDGPU" in BACKENDS && @eval unsafe_free!(x::AMDGPU.ROCArray) = AMDGPU.unsafe_free!(x)
+free!(floes::FixedWidthFloes) = foreach(f -> unsafe_free!(getfield(floes, f)), fieldnames(FixedWidthFloes))
 
 # What run! does for one call of timestep_floe_properties!, including the conversions and
 # copies between host and device
@@ -54,12 +81,19 @@ function full_step!(floes, Δt, fs, backend)
     host_floes = adapt(Array, dev_floes)
     update_floes!(floes, host_floes)
     _log_flags(host_floes.flags, 1, fs)
+    free!(dev_floes)
     return
 end
 
 function kernels!(dev_floes, Δt, fs, backend)
     timestep_floe_properties!(dev_floes, Δt, fs; backend)
     KernelAbstractions.synchronize(backend)
+end
+
+function to_device!(fwf, backend)
+    dev = adapt(backend, fwf)
+    KernelAbstractions.synchronize(backend)
+    free!(dev)
 end
 
 foreach(print_device, BACKENDS)
@@ -81,35 +115,57 @@ if isfile("result_main.jld2")
             all(f -> isapprox(res[f], ref[f]), keys(res)), ", max relative difference = $maxrel")
     end
 end
+
+# Every benchmark takes SAMPLES samples (or less if it takes longer than SECONDS). The
+# garbage collector runs before every sample (not timed), so that the arrays allocated by
+# earlier samples don't fill up the memory.
+macro bench(ex, setup = :nothing)
+    esc(:(@benchmark($ex, setup = $setup, evals = 1, samples = SAMPLES, seconds = SECONDS,
+        gcsample = true)))
+end
+
+const GPU_PEAK = Dict(name => 0 for name in BACKENDS)
+track_gpu_memory(name) = GPU_PEAK[name] = max(GPU_PEAK[name], gpu_used_memory(name))
+
 for n in SIZES
     floes, Δt = load_floes(n)
     fwf = FixedWidthFloes(floes)
     for name in BACKENDS
         backend = get_backend(name)
-        # Kernels only: floes are already on the device
-        trial = @benchmark(kernels!(d, $Δt, $fs64, $backend),
-            setup = (d = adapt($backend, deepcopy($fwf))), evals = 1, seconds = SECONDS)
-        report("branch $name Float64: kernels only", n, trial)
-        if name != "CPU"
-            fwf32 = to_float32(fwf)
-            trial = @benchmark(kernels!(d, $Δt, $fs32, $backend),
-                setup = (d = adapt($backend, deepcopy($fwf32))), evals = 1, seconds = SECONDS)
-            report("branch $name Float32: kernels only", n, trial)
+        # Kernels only: floes are already on the device. Every sample starts from the
+        # floes in src.
+        for (FT, fs) in (name == "CPU" ? ((Float64, fs64),) : ((Float64, fs64), (Float32, fs32)))
+            src = adapt(backend, FT == Float64 ? fwf : to_float32(fwf))
+            d = adapt(backend, deepcopy(src))
+            trial = @bench(kernels!($d, $(FT(Δt)), $fs, $backend), reset!($d, $src, $backend))
+            track_gpu_memory(name)
+            report("branch $name $FT: kernels only", n, trial)
+            free!(d)
+            FT == Float64 || free!(src)
         end
         # Breakdown of the extra work in run!
-        trial = @benchmark(FixedWidthFloes($floes), seconds = SECONDS)
+        trial = @bench(FixedWidthFloes($floes))
         report("branch $name: FixedWidthFloes(floes)", n, trial)
-        trial = @benchmark((adapt($backend, $fwf); KernelAbstractions.synchronize($backend)), seconds = SECONDS)
+        trial = @bench(to_device!($fwf, $backend))
+        track_gpu_memory(name)
         report("branch $name: adapt to device", n, trial)
         dev = adapt(backend, fwf)
-        trial = @benchmark(adapt(Array, $dev), seconds = SECONDS)
+        trial = @bench(adapt(Array, $dev))
+        track_gpu_memory(name)
         report("branch $name: adapt to host", n, trial)
-        trial = @benchmark(update_floes!(f, $fwf),
-            setup = (f = deepcopy($floes)), evals = 1, seconds = SECONDS)
+        free!(dev)
+        # Every sample starts from the floes in fwf. This is the same as resetting them.
+        f = deepcopy(floes)
+        trial = @bench(update_floes!($f, $fwf))
         report("branch $name: update_floes!", n, trial)
         # Everything together, as in run!
-        trial = @benchmark(full_step!(f, $Δt, $fs64, $backend),
-            setup = (f = deepcopy($floes)), evals = 1, seconds = SECONDS)
+        trial = @bench(full_step!($f, $Δt, $fs64, $backend), update_floes!($f, $fwf))
+        track_gpu_memory(name)
         report("branch $name Float64: full step as in run!", n, trial)
     end
+end
+report_host_memory()
+for name in filter(!=("CPU"), BACKENDS)
+    @printf("Peak %s memory in use (all processes, measured after each benchmark): %.2f GB\n",
+        name, GPU_PEAK[name] / 1e9)
 end

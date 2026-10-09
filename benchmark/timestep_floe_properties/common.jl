@@ -4,8 +4,12 @@ using Subzero, JLD2, StructArrays, BenchmarkTools, Logging, Printf
 const INFILE = get(ENV, "BENCH_FLOES", "floes_10k.jld2")
 # Numbers of floes to benchmark. Larger numbers than in INFILE are made by tiling copies
 # of the floe field next to each other in x.
-const SIZES = parse.(Int, split(get(ENV, "BENCH_SIZES", "1000,10000,100000"), ","))
-const SECONDS = parse(Float64, get(ENV, "BENCH_SECONDS", "10"))
+const SIZES = parse.(Int, split(get(ENV, "BENCH_SIZES", "100000"), ","))
+# Number of samples per benchmark, and the maximum time per benchmark in s
+const SAMPLES = parse(Int, get(ENV, "BENCH_SAMPLES", "20"))
+const SECONDS = parse(Float64, get(ENV, "BENCH_SECONDS", "60"))
+# Number of floes for the comparison of the branch's result with main's
+const CHECK_N = 1000
 
 function load_floes(n; file = INFILE)
     d = load(file)
@@ -52,3 +56,6 @@ global_logger(NullLogger())
 const CHECK_FIELDS = (:centroid, :height, :mass, :moment, :α, :u, :v, :ξ,
     :p_dxdt, :p_dydt, :p_dudt, :p_dvdt, :p_dξdt, :p_dαdt, :stress_accum, :stress_instant, :strain)
 result_fields(floes) = Dict(string(f) => collect(getproperty(floes, f)) for f in CHECK_FIELDS)
+
+# Peak memory use of this Julia process
+report_host_memory() = @printf("Peak host memory (max RSS): %.2f GB\n", Sys.maxrss() / 1e9)
